@@ -67,7 +67,11 @@ class CentroidTracker:
 def main():
     # Initialize serial
     try:
+<<<<<<< HEAD
         ser = serial.Serial('/dev/ttyUSB0',115200, timeout=0.1)
+=======
+        ser = serial.Serial('COM5', 9600, timeout=0.1)
+>>>>>>> c83fce34125832fc3459017cadaa374d65e4cb48
         time.sleep(2)
         ser.reset_input_buffer()
         print("Serial port opened.")
@@ -76,14 +80,22 @@ def main():
         ser = None
 
     # Initialize camera
+<<<<<<< HEAD
     cap = cv2.VideoCapture('/dev/video0', cv2.CAP_V4L2)
+=======
+    cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
+>>>>>>> c83fce34125832fc3459017cadaa374d65e4cb48
     if not cap.isOpened():
         print("Error: Camera not found or cannot be opened.")
         return
     cv2.namedWindow("YOLOv8 Tracking & Control", cv2.WINDOW_NORMAL)
     cv2.resizeWindow("YOLOv8 Tracking & Control", 800, 600)
 
+<<<<<<< HEAD
     model = YOLO(r"Project-Design-1/Weights/best2.pt")
+=======
+    model = YOLO(r"Weights\best2.pt")
+>>>>>>> c83fce34125832fc3459017cadaa374d65e4cb48
     tracker = CentroidTracker(max_disappeared=40, max_distance=60)
     detection_enabled = True
     print("Press 'q' to quit.")
@@ -134,7 +146,11 @@ def main():
             cv2.putText(vis, f"Count: {count}", (10,30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0,255,255), 2)
 
             # Send collect if needed
+<<<<<<< HEAD
             if count > 0   and ser:
+=======
+            if count >= 3   and ser:
+>>>>>>> c83fce34125832fc3459017cadaa374d65e4cb48
                 ser.write(b'COLLECT\n')
                 detection_enabled = False
                 print("Sent COLLECT command.")
