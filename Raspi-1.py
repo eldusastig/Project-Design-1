@@ -4,6 +4,12 @@ yolo_tracker_service.py
 
 Headless-capable YOLOv8 tracking + ESP32 serial control script.
 Designed to run as a systemd service on Linux (default camera /dev/video0).
+
+Modifications:
+- Always prints detection summary and per-detection lines to stdout (so you can
+  monitor detections on the Raspberry Pi terminal).
+- Adds --no-serial flag to run without an attached ESP32 (useful for debugging).
+- Keeps existing behavior of sending summaries to ESP32 (only when changed).
 """
 import argparse
 import logging
@@ -146,6 +152,7 @@ def build_argparser():
     p.add_argument('--show', action='store_true', help='Show GUI window (overrides headless).')
     p.add_argument('--logfile', default='/var/log/yolo_tracker.log', help='Optional log file (default /var/log/yolo_tracker.log)')
     p.add_argument('--collect-threshold', type=int, default=3, help='Number of tracked objects required to auto-send COLLECT (default 3)')
+    p.add_argument('--no-serial', action='store_true', help='Do not open serial port (debug mode).')
     return p
 
 def open_serial(port, baud, log):
@@ -182,8 +189,12 @@ def main():
     logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s: %(message)s', handlers=handlers)
     log = logging.getLogger('yolo-tracker')
 
-    # Serial
-    ser = open_serial(args.serial, args.baud, log)
+    # Serial (optional)
+    ser = None
+    if not args.no_serial:
+        ser = open_serial(args.serial, args.baud, log)
+    else:
+        log.info("Running with --no-serial; serial disabled.")
 
     # Camera
     try:
@@ -202,7 +213,10 @@ def main():
         model = YOLO(args.weights)
     except Exception as e:
         log.error("Failed to load model weights: %s", e)
-        cap.release()
+        try:
+            cap.release()
+        except Exception:
+            pass
         return 1
 
     tracker = CentroidTracker(max_disappeared=40, max_distance=60)
@@ -225,6 +239,9 @@ def main():
                             text = str(raw)
                         if text:
                             log.info("[ESP32] %s", text)
+                            # Print to terminal as well
+                            sys.stdout.write(f"[ESP32] {text}\n")
+                            sys.stdout.flush()
                             if text.strip().lower() == 'done':
                                 detection_enabled = True
                                 tracker = CentroidTracker(max_disappeared=40, max_distance=60)
@@ -239,15 +256,15 @@ def main():
                 continue
             if not detection_enabled:
                 if args.show:
-                    vis=frame.copy()
-                    cv2.putText(vis, "Collecting... (waiting for Done)",(10,30),
-                                cv2.FONT_HERSHEY_SIMPLEX,0.8,(0,0,255), 2)
+                    vis = frame.copy()
+                    cv2.putText(vis, "Collecting... (waiting for Done)", (10,30),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,0,255), 2)
                     cv2.imshow("YoloV8 Tracking & Control", vis)
                     if cv2.waitKey(1) & 0xFF == ord('q'):
                         break
                 else:
                     time.sleep(0.05)
-                continue     
+                continue
 
             # Preprocess (same approach as original code)
             try:
@@ -291,7 +308,12 @@ def main():
             unique_classes = unique_preserve_order(class_names)
             summary_line = "DETECTIONS:" + (",".join(unique_classes) if unique_classes else "none")
 
-            # Log detailed detections
+            # --- ALWAYS print summary to terminal (guaranteed visibility on RasPi) ---
+            # Short console output for quick monitoring
+            sys.stdout.write(f"[DETECTION_SUMMARY] {summary_line} | tracked={count}\n")
+            sys.stdout.flush()
+
+            # Log detailed detections (and print them)
             try:
                 confs = getattr(results.boxes, "conf", None)
                 cls = getattr(results.boxes, "cls", None)
@@ -315,22 +337,29 @@ def main():
 
                 for i, box in enumerate(det_boxes):
                     nm = "unknown"
-                    if i < len(cls_list) and cls_list[i] in model.names:
+                    if i < len(cls_list) and cls_list[i] in getattr(model, "names", {}):
                         nm = model.names[cls_list[i]]
                     elif i < len(class_names):
                         nm = class_names[i]
                     cf = conf_list[i] if i < len(conf_list) else 0.0
                     log.info("[DETECT] %s (%.2f) bbox=%s", nm, cf, box)
+                    # mirror to stdout so terminal always shows
+                    sys.stdout.write(f"[DETECT] {nm} ({cf:.2f}) bbox={box}\n")
+                    sys.stdout.flush()
             except Exception:
                 log.info("[DETECT] summary=%s count=%d", summary_line, count)
+                sys.stdout.write(f"[DETECT] summary={summary_line} count={count}\n")
+                sys.stdout.flush()
 
-            # send summary when changed
+            # send summary when changed (still use change detection to avoid flooding serial)
             if ser and summary_line != last_sent_summary:
                 try:
                     ser.write((summary_line + "\n").encode('utf-8'))
                     ser.flush()
                     last_sent_summary = summary_line
                     log.info("[SENT->ESP32] %s", summary_line)
+                    sys.stdout.write(f"[SENT->ESP32] {summary_line}\n")
+                    sys.stdout.flush()
                 except Exception as e:
                     log.warning("Serial write failed: %s", e)
 
@@ -341,6 +370,8 @@ def main():
                     ser.flush()
                     detection_enabled = False
                     log.info("Sent COLLECT command (threshold=%d).", args.collect_threshold)
+                    sys.stdout.write("[SENT->ESP32] COLLECT\n")
+                    sys.stdout.flush()
                 except Exception as e:
                     log.warning("Failed to send COLLECT: %s", e)
 
