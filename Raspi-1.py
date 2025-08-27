@@ -364,7 +364,8 @@ def main():
                     log.warning("Serial write failed: %s", e)
 
             # automatic COLLECT threshold (if desired)
-            if detection_enabled and count >= args.collect_threshold and ser:
+            frame_count=len(det_boxes)
+            if detection_enabled and frame_count >= args.collect_threshold and ser:
                 try:
                     ser.write(b'COLLECT\n')
                     ser.flush()
@@ -419,3 +420,4 @@ def main():
 
 if __name__ == '__main__':
     sys.exit(main())
+
