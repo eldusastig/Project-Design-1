@@ -243,7 +243,7 @@ def main():
                     cv2.putText(vis, "Collecting... (waiting for Done)",(10,30),
                                 cv2.FONT_HERSHEY_SIMPLEX,0.8,(0,0,255), 2)
                     cv2.imshow("YoloV8 Tracking & Control", vis)
-                    if cv2.waitkey(1)& 0xff ==ord('q'):
+                    if cv2.waitKey(1) & 0xFF == ord('q'):
                         break
                 else:
                     time.sleep(0.05)
