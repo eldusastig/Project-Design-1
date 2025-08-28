@@ -4,13 +4,6 @@ yolo_tracker_service.py
 
 Headless-capable YOLOv8 tracking + ESP32 serial control script.
 Designed to run as a systemd service on Linux (default camera /dev/video0).
-
-Patch notes (added behavior):
- - Use per-frame detection counts (optionally filtered by class names) to decide COLLECT.
- - Require multiple consecutive frames (configurable) before sending COLLECT.
- - Watchdog timeout: if COLLECT was sent but no DONE arrives within timeout seconds,
-   re-enable detection automatically to avoid permanent stall.
- - New CLI args: --collect-consecutive, --collect-classes, --collect-timeout.
 """
 import argparse
 import logging
@@ -61,7 +54,6 @@ class CentroidTracker:
 
         object_ids = list(self.objects.keys())
         object_centroids = np.array([c for c, _ in self.objects.values()])
-        # distance matrix
         D = np.linalg.norm(object_centroids[:, None] - input_centroids[None, :], axis=2)
 
         rows, cols = np.where(D <= self.max_distance)
@@ -75,14 +67,12 @@ class CentroidTracker:
             used_rows.add(r)
             used_cols.add(c)
 
-        # increment disappeared for unmatched
         for r, oid in enumerate(object_ids):
             if r not in used_rows:
                 self.disappeared[oid] += 1
                 if self.disappeared[oid] > self.max_disappeared:
                     self.deregister(oid)
 
-        # register new unmatched detections
         for c in range(len(rects)):
             if c not in used_cols:
                 self.register(tuple(input_centroids[c]), rects[c])
@@ -153,9 +143,6 @@ def build_argparser():
     p.add_argument('--show', action='store_true', help='Show GUI window (overrides headless).')
     p.add_argument('--logfile', default='/var/log/yolo_tracker.log', help='Optional log file (default /var/log/yolo_tracker.log)')
     p.add_argument('--collect-threshold', type=int, default=3, help='Number of tracked objects required to auto-send COLLECT (default 3)')
-    p.add_argument('--collect-consecutive', type=int, default=2, help='Number of consecutive frames meeting threshold before sending COLLECT (default 2)')
-    p.add_argument('--collect-classes', default=None, help='Comma-separated class names to count toward COLLECT (default: any class). Example: "trash,bin"')
-    p.add_argument('--collect-timeout', type=int, default=120, help='Seconds to wait for DONE before re-enabling detection (watchdog, default 120s)')
     p.add_argument('--no-serial', action='store_true', help='Do not open serial port (debug mode).')
     return p
 
@@ -171,12 +158,6 @@ def open_serial(port, baud, log):
     except Exception as e:
         log.warning("Could not open serial %s: %s", port, e)
         return None
-
-def matches_collect_classes(class_name: str, allowed: Optional[Sequence[str]]) -> bool:
-    if allowed is None:
-        return True
-    # allowed is normalized to lower-case
-    return class_name.lower() in allowed
 
 def main():
     args = build_argparser().parse_args()
@@ -194,7 +175,6 @@ def main():
         try:
             handlers.append(logging.FileHandler(args.logfile))
         except Exception:
-            # fallback to stdout only if file cannot be opened
             pass
     logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s: %(message)s', handlers=handlers)
     log = logging.getLogger('yolo-tracker')
@@ -209,7 +189,6 @@ def main():
     # Camera
     try:
         backend = cv2.CAP_V4L2 if args.device_backend == 'v4l2' else 0
-        # cv2.VideoCapture accepts int index or string path - use device string
         cap = cv2.VideoCapture(args.camera, backend)
         if not cap.isOpened():
             log.error("Camera cannot be opened: %s (backend=%s)", args.camera, args.device_backend)
@@ -234,16 +213,7 @@ def main():
     last_sent_summary = None
     last_log_time = time.time()
 
-    # collect-state variables
-    consecutive_ok_frames = 0
-    collect_start_ts: Optional[float] = None   # timestamp when COLLECT was sent (watchdog)
-    collect_classes_set = None
-    if args.collect_classes:
-        collect_classes_set = set([c.strip().lower() for c in args.collect_classes.split(',') if c.strip()])
-
     log.info("Starting main loop (headless=%s) weights=%s camera=%s", not args.show, args.weights, args.camera)
-    log.info("COLLECT settings: threshold=%d consecutive=%d classes=%s timeout=%ds",
-             args.collect_threshold, args.collect_consecutive, (",".join(sorted(collect_classes_set)) if collect_classes_set else "ANY"), args.collect_timeout)
 
     try:
         while not STOP:
@@ -258,27 +228,14 @@ def main():
                             text = str(raw)
                         if text:
                             log.info("[ESP32] %s", text)
-                            # Print to terminal as well
                             sys.stdout.write(f"[ESP32] {text}\n")
                             sys.stdout.flush()
-                            # handle DONE (case-insensitive)
                             if text.strip().lower() == 'done':
                                 detection_enabled = True
                                 tracker = CentroidTracker(max_disappeared=40, max_distance=60)
-                                consecutive_ok_frames = 0
-                                collect_start_ts = None
                                 log.info("Re-enabled detection after DONE.")
                 except Exception as e:
                     log.debug("Serial read error: %s", e)
-
-            # If we've previously sent COLLECT and collect_start_ts is set, check watchdog timeout
-            if not detection_enabled and collect_start_ts is not None:
-                elapsed = time.time() - collect_start_ts
-                if elapsed > max(1, args.collect_timeout):
-                    log.warning("[WATCHDOG] No DONE received within %ds; re-enabling detection.", args.collect_timeout)
-                    detection_enabled = True
-                    consecutive_ok_frames = 0
-                    collect_start_ts = None
 
             ret, frame = cap.read()
             if not ret:
@@ -297,7 +254,7 @@ def main():
                     time.sleep(0.05)
                 continue
 
-            # Preprocess (same approach as original code)
+            # Preprocess
             try:
                 lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
                 l, a, b = cv2.split(lab)
@@ -316,7 +273,7 @@ def main():
                 time.sleep(0.05)
                 continue
 
-            # Build det_boxes list from results
+            # Build det_boxes
             det_boxes = []
             try:
                 xyxy = getattr(results.boxes, "xyxy", None)
@@ -332,20 +289,16 @@ def main():
 
             # Update tracker
             objects = tracker.update(det_boxes)
-            # tracker.count is len(objects) but we will use per-frame counts for COLLECT decision
             tracked_count = len(objects)
 
             # Extract class names and build summary
             class_names = extract_class_names(results, model)
             unique_classes = unique_preserve_order(class_names)
             summary_line = "DETECTIONS:" + (",".join(unique_classes) if unique_classes else "none")
-
-            # --- ALWAYS print summary to terminal (guaranteed visibility on RasPi) ---
             sys.stdout.write(f"[DETECTION_SUMMARY] {summary_line} | tracked={tracked_count} det_boxes={len(det_boxes)}\n")
             sys.stdout.flush()
 
-            # Log detailed detections (and print them)
-            # Also build per-box class names to support per-frame counting
+            # Log per-box detections
             per_box_classnames = []
             try:
                 confs = getattr(results.boxes, "conf", None)
@@ -384,7 +337,7 @@ def main():
                 sys.stdout.write(f"[DETECT] summary={summary_line} count={tracked_count}\n")
                 sys.stdout.flush()
 
-            # send summary when changed (still use change detection to avoid flooding serial)
+            # Send summary to ESP32 if changed
             if ser and summary_line != last_sent_summary:
                 try:
                     ser.write((summary_line + "\n").encode('utf-8'))
@@ -396,82 +349,50 @@ def main():
                 except Exception as e:
                     log.warning("Serial write failed: %s", e)
 
-            # ----- NEW: Determine per-frame count for COLLECT -----
-            # If collect_classes_set is provided, only count boxes whose detected class name
-            # matches one of those names (case-insensitive exact match).
-            in_frame_count = 0
-            if per_box_classnames:
-                if collect_classes_set:
-                    in_frame_count = sum(1 for nm in per_box_classnames if matches_collect_classes(nm, collect_classes_set))
-                else:
-                    in_frame_count = len(per_box_classnames)
-            else:
-                in_frame_count = 0
-
-            # increment consecutive counter when current frame meets threshold; else reset
-            if in_frame_count >= args.collect_threshold:
-                consecutive_ok_frames += 1
-            else:
-                consecutive_ok_frames = 0
-
-            # if we've satisfied the consecutive frames requirement and detection_enabled, send COLLECT
-            if detection_enabled and consecutive_ok_frames >= max(1, args.collect_consecutive) and ser:
+            # ------------------- SIMPLE COLLECT -------------------
+            # Use Code 2 logic: send COLLECT if tracked_count >= threshold
+            if detection_enabled and tracked_count >= args.collect_threshold and ser:
                 try:
                     ser.write(b'COLLECT\n')
                     ser.flush()
                     detection_enabled = False
                     collect_start_ts = time.time()
-                    log.info("Sent COLLECT command (threshold=%d consecutive=%d).", args.collect_threshold, args.collect_consecutive)
+                    log.info("Sent COLLECT command (threshold=%d).", args.collect_threshold)
                     sys.stdout.write("[SENT->ESP32] COLLECT\n")
                     sys.stdout.flush()
-                    # reset consecutive counter so we don't send again immediately
-                    consecutive_ok_frames = 0
                 except Exception as e:
                     log.warning("Failed to send COLLECT: %s", e)
+            # -------------------------------------------------------
 
-            # GUI display (only if requested)
+            # GUI display
             if args.show:
                 try:
                     vis = processed.copy()
                     for (x1, y1, x2, y2) in det_boxes:
                         cv2.rectangle(vis, (x1, y1), (x2, y2), (0, 255, 0), 2)
                     for oid, (centroid, bbox) in objects.items():
-                        cv2.putText(vis, f"ID:{oid}", (bbox[0], bbox[1]-10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,200,0), 1)
-                    # display summary + per-frame count for debugging
-                    debug_line = f"{summary_line} | tracked={tracked_count} frame_count={in_frame_count}"
-                    cv2.putText(vis, debug_line, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 2)
-                    cv2.imshow("YOLOv8 Tracking & Control", vis)
+                        cv2.putText(vis, f"ID:{oid}", (centroid[0]-10, centroid[1]-10),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,0,255), 2)
+                        cv2.circle(vis, centroid, 4, (255,0,0), -1)
+                    cv2.imshow("YoloV8 Tracking & Control", vis)
                     if cv2.waitKey(1) & 0xFF == ord('q'):
-                        log.info("Quit requested via GUI.")
                         break
                 except Exception as e:
-                    log.debug("GUI display error: %s", e)
-            else:
-                # headless: throttle CPU a bit and log periodic status
-                time.sleep(0.005)
-                if time.time() - last_log_time > 2.0:
-                    log.info("Headless status: %s | tracked=%d frame_count=%d", summary_line, tracked_count, in_frame_count)
-                    last_log_time = time.time()
+                    log.debug("Display error: %s", e)
 
-    except Exception as e:
-        log.exception("Unhandled exception in main loop: %s", e)
     finally:
-        log.info("Shutting down main loop.")
         try:
             cap.release()
         except Exception:
             pass
         if args.show:
-            try:
-                cv2.destroyAllWindows()
-            except Exception:
-                pass
+            cv2.destroyAllWindows()
         if ser:
             try:
                 ser.close()
             except Exception:
                 pass
-    return 0
+        log.info("Exiting cleanly.")
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     sys.exit(main())
