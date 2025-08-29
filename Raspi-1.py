@@ -26,7 +26,7 @@ from ultralytics import YOLO
 from collections import deque
 
 # ----------------------- CONFIGURATION -----------------------
-MODEL_PATH = "/home/pi/yolo_models/debris_model.pt"
+MODEL_PATH = "/home/Team23/ProjectDesignMain/Project-Design-1/Weights/main.pt"
 SERIAL_PORT = "/dev/ttyUSB0"
 BAUD_RATE = 115200
 DETECTION_THRESHOLD = 4
@@ -198,3 +198,4 @@ if __name__ == "__main__":
     parser.add_argument("--show", action="store_true", help="Show camera output for debugging")
     args = parser.parse_args()
     main(show=args.show)
+
