@@ -5,7 +5,7 @@ yolo_debris_service.py
 Headless YOLOv8 debris counter with:
 - IoU-based unique counting
 - Pause/resume after "COLLECT"
-- JSON logs + serial + MQTT support
+- JSON logs + serial
 - Logging via Python logging (journald/systemd friendly)
 - Preprocessing for better detection
 - Optional GUI mode for debugging
@@ -13,7 +13,6 @@ Headless YOLOv8 debris counter with:
 """
 
 import cv2
-import torch
 import serial
 import json
 import time
@@ -32,7 +31,6 @@ SERIAL_PORT = "/dev/ttyUSB0"
 BAUD_RATE = 115200
 DETECTION_THRESHOLD = 4
 CONF_THRESHOLD = 0.5
-MQTT_TOPIC = "debris/logs"  # For MQTT publishing later
 LOG_FILE = "/var/log/yolo_debris_service.log"
 COOLDOWN = 10  # seconds
 MAX_TRACK_MEMORY = 50
@@ -131,14 +129,17 @@ def main(show=False):
         detections = results[0].boxes
 
         current_boxes = []
+        detected_classes = []
         debris_count = 0
 
         for box in detections:
             cls_id = int(box.cls[0])
+            cls_name = model.names[cls_id]
             conf = float(box.conf[0])
             if conf >= CONF_THRESHOLD:
                 x1, y1, x2, y2 = map(int, box.xyxy[0])
                 current_boxes.append((x1, y1, x2, y2))
+                detected_classes.append(cls_name)
 
         # Unique count using IoU
         for cb in current_boxes:
@@ -146,12 +147,13 @@ def main(show=False):
                 tracked_boxes.append(cb)
                 debris_count += 1
 
-        # Create log
+        # Create log with class names
         log_data = {
             "timestamp": datetime.now().isoformat(),
             "frame_detected": len(current_boxes),
             "unique_detected": debris_count,
-            "threshold": DETECTION_THRESHOLD
+            "threshold": DETECTION_THRESHOLD,
+            "classes": detected_classes
         }
 
         logging.info(json.dumps(log_data))
