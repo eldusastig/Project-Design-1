@@ -1,398 +1,198 @@
 #!/usr/bin/env python3
 """
-yolo_tracker_service.py
+yolo_debris_service.py
 
-Headless-capable YOLOv8 tracking + ESP32 serial control script.
-Designed to run as a systemd service on Linux (default camera /dev/video0).
+Headless YOLOv8 debris counter with:
+- IoU-based unique counting
+- Pause/resume after "COLLECT"
+- JSON logs + serial + MQTT support
+- Logging via Python logging (journald/systemd friendly)
+- Preprocessing for better detection
+- Optional GUI mode for debugging
+- Runs as a systemd service on Raspberry Pi
 """
-import argparse
-import logging
-import time
-import signal
-import sys
-import os
-from typing import List, Tuple, Optional, Sequence
 
 import cv2
-import numpy as np
+import torch
 import serial
+import json
+import time
+import logging
+import signal
+import sys
+import argparse
+import numpy as np
+from datetime import datetime
 from ultralytics import YOLO
+from collections import deque
 
-# ---------------------------
-# CentroidTracker (unchanged logic)
-# ---------------------------
-class CentroidTracker:
-    def __init__(self, max_disappeared=50, max_distance=50):
-        self.next_object_id = 0
-        self.objects = {}          # object_id -> (centroid, bbox)
-        self.disappeared = {}      # object_id -> disappeared_count
-        self.max_disappeared = max_disappeared
-        self.max_distance = max_distance
+# ----------------------- CONFIGURATION -----------------------
+MODEL_PATH = "/home/pi/yolo_models/debris_model.pt"
+SERIAL_PORT = "/dev/ttyUSB0"
+BAUD_RATE = 115200
+DETECTION_THRESHOLD = 4
+CONF_THRESHOLD = 0.5
+MQTT_TOPIC = "debris/logs"  # For MQTT publishing later
+LOG_FILE = "/var/log/yolo_debris_service.log"
+COOLDOWN = 10  # seconds
+MAX_TRACK_MEMORY = 50
+IOU_THRESHOLD = 0.3
+# -------------------------------------------------------------
 
-    def register(self, centroid, bbox):
-        self.objects[self.next_object_id] = (centroid, bbox)
-        self.disappeared[self.next_object_id] = 0
-        self.next_object_id += 1
+# Initialize logging for systemd (journald) and file
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.StreamHandler(sys.stdout),  # Journald/systemd
+        logging.FileHandler(LOG_FILE)       # Local log file
+    ]
+)
 
-    def deregister(self, object_id):
-        self.objects.pop(object_id, None)
-        self.disappeared.pop(object_id, None)
+# Global flags
+stop_requested = False
+paused = False
 
-    def update(self, rects: List[Tuple[int, int, int, int]]):
-        if not rects:
-            for oid in list(self.disappeared.keys()):
-                self.disappeared[oid] += 1
-                if self.disappeared[oid] > self.max_disappeared:
-                    self.deregister(oid)
-            return self.objects
 
-        input_centroids = np.array([[(x1 + x2) // 2, (y1 + y2) // 2] for x1, y1, x2, y2 in rects])
-        if not self.objects:
-            for i, centroid in enumerate(input_centroids):
-                self.register(tuple(centroid), rects[i])
-            return self.objects
+def signal_handler(sig, frame):
+    global stop_requested
+    logging.info("Shutdown signal received, stopping gracefully...")
+    stop_requested = True
 
-        object_ids = list(self.objects.keys())
-        object_centroids = np.array([c for c, _ in self.objects.values()])
-        D = np.linalg.norm(object_centroids[:, None] - input_centroids[None, :], axis=2)
 
-        rows, cols = np.where(D <= self.max_distance)
-        used_rows, used_cols = set(), set()
-        for r, c in zip(rows, cols):
-            if r in used_rows or c in used_cols:
-                continue
-            oid = object_ids[r]
-            self.objects[oid] = (tuple(input_centroids[c]), rects[c])
-            self.disappeared[oid] = 0
-            used_rows.add(r)
-            used_cols.add(c)
+signal.signal(signal.SIGINT, signal_handler)
+signal.signal(signal.SIGTERM, signal_handler)
 
-        for r, oid in enumerate(object_ids):
-            if r not in used_rows:
-                self.disappeared[oid] += 1
-                if self.disappeared[oid] > self.max_disappeared:
-                    self.deregister(oid)
 
-        for c in range(len(rects)):
-            if c not in used_cols:
-                self.register(tuple(input_centroids[c]), rects[c])
+# ----------------------- UTILITIES -----------------------
+def preprocess_frame(frame):
+    """Apply LAB normalization + sharpening for better low-light performance."""
+    lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
+    l, a, b = cv2.split(lab)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    cl = clahe.apply(l)
+    merged = cv2.merge((cl, a, b))
+    frame = cv2.cvtColor(merged, cv2.COLOR_LAB2BGR)
 
-        return self.objects
+    # Sharpen
+    kernel = np.array([[0, -1, 0],
+                       [-1, 5, -1],
+                       [0, -1, 0]])
+    frame = cv2.filter2D(frame, -1, kernel)
+    return frame
 
-# ---------------------------
-# Helpers
-# ---------------------------
-def unique_preserve_order(seq):
-    seen = set()
-    out = []
-    for x in seq:
-        if x not in seen:
-            seen.add(x)
-            out.append(x)
-    return out
 
-def extract_class_names(results, model):
-    names_map = getattr(model, "names", None) or {}
-    class_list = []
-    boxes = getattr(results, "boxes", None)
-    if not boxes or len(boxes) == 0:
-        return []
-    cls_attr = getattr(boxes, "cls", None)
-    if cls_attr is None:
-        return []
-    # convert to python list safely
-    try:
-        cls_indices = cls_attr.cpu().numpy().tolist()
-    except Exception:
-        try:
-            cls_indices = cls_attr.numpy().tolist()
-        except Exception:
-            try:
-                cls_indices = list(cls_attr)
-            except Exception:
-                cls_indices = []
-    for ci in cls_indices:
-        try:
-            idx = int(ci)
-        except Exception:
+def compute_iou(box1, box2):
+    """Compute Intersection over Union (IoU) between two boxes."""
+    x1, y1, x2, y2 = box1
+    x1b, y1b, x2b, y2b = box2
+    inter_x1, inter_y1 = max(x1, x1b), max(y1, y1b)
+    inter_x2, inter_y2 = min(x2, x2b), min(y2, y2b)
+
+    if inter_x2 <= inter_x1 or inter_y2 <= inter_y1:
+        return 0.0
+
+    intersection = (inter_x2 - inter_x1) * (inter_y2 - inter_y1)
+    union = ((x2 - x1) * (y2 - y1)) + ((x2b - x1b) * (y2b - y1b)) - intersection
+    return intersection / union
+
+
+# ----------------------- MAIN LOGIC -----------------------
+def main(show=False):
+    global paused
+    logging.info("Starting YOLO debris detection service...")
+
+    # Load YOLO model
+    model = YOLO(MODEL_PATH)
+    logging.info(f"Loaded YOLO model from {MODEL_PATH}")
+
+    # Open serial
+    ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=1)
+    logging.info(f"Opened serial on {SERIAL_PORT} at {BAUD_RATE} baud")
+
+    # Open camera
+    cap = cv2.VideoCapture(0)
+    if not cap.isOpened():
+        logging.error("Camera not found!")
+        return
+
+    last_collect_time = 0
+    tracked_boxes = deque(maxlen=MAX_TRACK_MEMORY)
+
+    while not stop_requested:
+        ret, frame = cap.read()
+        if not ret:
             continue
-        class_list.append(str(names_map[idx]) if idx in names_map else str(idx))
-    return class_list
 
-# ---------------------------
-# Main
-# ---------------------------
-STOP = False
-def _signal_handler(signum, frame):
-    global STOP
-    STOP = True
+        frame = preprocess_frame(frame)
 
-signal.signal(signal.SIGTERM, _signal_handler)
-signal.signal(signal.SIGINT, _signal_handler)
+        # YOLO inference
+        results = model(frame, conf=CONF_THRESHOLD, verbose=False)
+        detections = results[0].boxes
 
-def build_argparser():
-    p = argparse.ArgumentParser(description="YOLOv8 Tracking & ESP32 Control (service-friendly)")
-    p.add_argument('--serial', default='/dev/ttyUSB0', help='Serial port to ESP32 (default /dev/ttyUSB0)')
-    p.add_argument('--baud', type=int, default=115200, help='Serial baud rate (default 115200)')
-    p.add_argument('--weights', default=os.path.join('Project-Design-1', 'Weights', 'best2.pt'),
-                   help='YOLO weights path (default Project-Design-1/Weights/best2.pt)')
-    p.add_argument('--conf', type=float, default=0.43, help='Detection confidence (default 0.43)')
-    p.add_argument('--camera', default='/dev/video0', help='Camera device (default /dev/video0)')
-    p.add_argument('--device-backend', default='v4l2', choices=['v4l2', 'default'],
-                   help='Camera backend (v4l2 recommended on Linux)')
-    p.add_argument('--show', action='store_true', help='Show GUI window (overrides headless).')
-    p.add_argument('--logfile', default='/var/log/yolo_tracker.log', help='Optional log file (default /var/log/yolo_tracker.log)')
-    p.add_argument('--collect-threshold', type=int, default=3, help='Number of tracked objects required to auto-send COLLECT (default 3)')
-    p.add_argument('--no-serial', action='store_true', help='Do not open serial port (debug mode).')
-    return p
+        current_boxes = []
+        debris_count = 0
 
-def open_serial(port, baud, log):
-    if not port:
-        return None
-    try:
-        ser = serial.Serial(port, baud, timeout=0.1)
-        time.sleep(2)
-        ser.reset_input_buffer()
-        log.info("Serial opened: %s @ %d", port, baud)
-        return ser
-    except Exception as e:
-        log.warning("Could not open serial %s: %s", port, e)
-        return None
+        for box in detections:
+            cls_id = int(box.cls[0])
+            conf = float(box.conf[0])
+            if conf >= CONF_THRESHOLD:
+                x1, y1, x2, y2 = map(int, box.xyxy[0])
+                current_boxes.append((x1, y1, x2, y2))
 
-def main():
-    args = build_argparser().parse_args()
-    # ensure logfile directory exists
-    try:
-        logfile_dir = os.path.dirname(args.logfile)
-        if logfile_dir and not os.path.exists(logfile_dir):
-            os.makedirs(logfile_dir, exist_ok=True)
-    except Exception:
-        pass
+        # Unique count using IoU
+        for cb in current_boxes:
+            if not any(compute_iou(cb, tb) > IOU_THRESHOLD for tb in tracked_boxes):
+                tracked_boxes.append(cb)
+                debris_count += 1
 
-    # logging
-    handlers = [logging.StreamHandler(sys.stdout)]
-    if args.logfile:
-        try:
-            handlers.append(logging.FileHandler(args.logfile))
-        except Exception:
-            pass
-    logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s: %(message)s', handlers=handlers)
-    log = logging.getLogger('yolo-tracker')
+        # Create log
+        log_data = {
+            "timestamp": datetime.now().isoformat(),
+            "frame_detected": len(current_boxes),
+            "unique_detected": debris_count,
+            "threshold": DETECTION_THRESHOLD
+        }
 
-    # Serial (optional)
-    ser = None
-    if not args.no_serial:
-        ser = open_serial(args.serial, args.baud, log)
-    else:
-        log.info("Running with --no-serial; serial disabled.")
+        logging.info(json.dumps(log_data))
 
-    # Camera
-    try:
-        backend = cv2.CAP_V4L2 if args.device_backend == 'v4l2' else 0
-        cap = cv2.VideoCapture(args.camera, backend)
-        if not cap.isOpened():
-            log.error("Camera cannot be opened: %s (backend=%s)", args.camera, args.device_backend)
-            return 1
-    except Exception as e:
-        log.error("Exception opening camera: %s", e)
-        return 1
+        # Send logs to ESP32 via serial
+        ser.write((json.dumps(log_data) + "\n").encode())
 
-    # Model
-    try:
-        model = YOLO(args.weights)
-    except Exception as e:
-        log.error("Failed to load model weights: %s", e)
-        try:
-            cap.release()
-        except Exception:
-            pass
-        return 1
+        # Check threshold
+        if debris_count >= DETECTION_THRESHOLD and not paused:
+            now = time.time()
+            if now - last_collect_time >= COOLDOWN:
+                logging.info("Threshold reached, sending COLLECT to ESP32...")
+                ser.write(b"COLLECT\n")
+                paused = True
+                last_collect_time = now
 
-    tracker = CentroidTracker(max_disappeared=40, max_distance=60)
-    detection_enabled = True
-    last_sent_summary = None
-    last_log_time = time.time()
+        # Handle pause/resume logic
+        if paused:
+            line = ser.readline().decode().strip()
+            if line == "DONE":
+                logging.info("Received DONE from ESP32, resuming detection...")
+                paused = False
+                tracked_boxes.clear()
 
-    log.info("Starting main loop (headless=%s) weights=%s camera=%s", not args.show, args.weights, args.camera)
+        # Show frame if GUI mode
+        if show:
+            for (x1, y1, x2, y2) in current_boxes:
+                cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+            cv2.imshow("YOLO Debris Detection", frame)
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                break
 
-    try:
-        while not STOP:
-            # read serial replies immediately
-            if ser:
-                try:
-                    if ser.in_waiting:
-                        raw = ser.read(ser.in_waiting)
-                        try:
-                            text = raw.decode('utf-8', errors='ignore').strip()
-                        except Exception:
-                            text = str(raw)
-                        if text:
-                            log.info("[ESP32] %s", text)
-                            sys.stdout.write(f"[ESP32] {text}\n")
-                            sys.stdout.flush()
-                            if text.strip().lower() == 'done':
-                                detection_enabled = True
-                                tracker = CentroidTracker(max_disappeared=40, max_distance=60)
-                                log.info("Re-enabled detection after DONE.")
-                except Exception as e:
-                    log.debug("Serial read error: %s", e)
+    cap.release()
+    ser.close()
+    if show:
+        cv2.destroyAllWindows()
+    logging.info("Service stopped.")
 
-            ret, frame = cap.read()
-            if not ret:
-                log.warning("Failed to read frame from camera")
-                time.sleep(0.05)
-                continue
-            if not detection_enabled:
-                if args.show:
-                    vis = frame.copy()
-                    cv2.putText(vis, "Collecting... (waiting for Done)", (10,30),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,0,255), 2)
-                    cv2.imshow("YoloV8 Tracking & Control", vis)
-                    if cv2.waitKey(1) & 0xFF == ord('q'):
-                        break
-                else:
-                    time.sleep(0.05)
-                continue
-
-            # Preprocess
-            try:
-                lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
-                l, a, b = cv2.split(lab)
-                l = cv2.normalize(l, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
-                processed = cv2.filter2D(cv2.cvtColor(cv2.merge((l, a, b)), cv2.COLOR_LAB2BGR),
-                                         -1, np.array([[0, -1, 0], [-1, 5, -1], [0, -1, 0]]))
-            except Exception as e:
-                log.debug("Preprocess failed, using raw frame: %s", e)
-                processed = frame
-
-            # Run model
-            try:
-                results = model(processed, conf=args.conf)[0]
-            except Exception as e:
-                log.error("Model error: %s", e)
-                time.sleep(0.05)
-                continue
-
-            # Build det_boxes
-            det_boxes = []
-            try:
-                xyxy = getattr(results.boxes, "xyxy", None)
-                if xyxy is not None:
-                    try:
-                        xy_list = xyxy.cpu().numpy().tolist()
-                    except Exception:
-                        xy_list = [b.tolist() for b in xyxy]
-                    for b in xy_list:
-                        det_boxes.append(tuple(map(int, b[:4])))
-            except Exception:
-                det_boxes = []
-
-            # Update tracker
-            objects = tracker.update(det_boxes)
-            tracked_count = len(objects)
-
-            # Extract class names and build summary
-            class_names = extract_class_names(results, model)
-            unique_classes = unique_preserve_order(class_names)
-            summary_line = "DETECTIONS:" + (",".join(unique_classes) if unique_classes else "none")
-            sys.stdout.write(f"[DETECTION_SUMMARY] {summary_line} | tracked={tracked_count} det_boxes={len(det_boxes)}\n")
-            sys.stdout.flush()
-
-            # Log per-box detections
-            per_box_classnames = []
-            try:
-                confs = getattr(results.boxes, "conf", None)
-                cls = getattr(results.boxes, "cls", None)
-                conf_list, cls_list = [], []
-                if confs is not None:
-                    try:
-                        conf_list = confs.cpu().numpy().tolist()
-                    except Exception:
-                        try:
-                            conf_list = [float(x) for x in confs.tolist()]
-                        except Exception:
-                            conf_list = []
-                if cls is not None:
-                    try:
-                        cls_list = cls.cpu().numpy().astype(int).tolist()
-                    except Exception:
-                        try:
-                            cls_list = [int(x) for x in cls.tolist()]
-                        except Exception:
-                            cls_list = []
-
-                for i, box in enumerate(det_boxes):
-                    nm = "unknown"
-                    if i < len(cls_list) and cls_list[i] in getattr(model, "names", {}):
-                        nm = model.names[cls_list[i]]
-                    elif i < len(class_names):
-                        nm = class_names[i]
-                    per_box_classnames.append(nm)
-                    cf = conf_list[i] if i < len(conf_list) else 0.0
-                    log.info("[DETECT] %s (%.2f) bbox=%s", nm, cf, box)
-                    sys.stdout.write(f"[DETECT] {nm} ({cf:.2f}) bbox={box}\n")
-                    sys.stdout.flush()
-            except Exception:
-                log.info("[DETECT] summary=%s count=%d", summary_line, tracked_count)
-                sys.stdout.write(f"[DETECT] summary={summary_line} count={tracked_count}\n")
-                sys.stdout.flush()
-
-            # Send summary to ESP32 if changed
-            if ser and summary_line != last_sent_summary:
-                try:
-                    ser.write((summary_line + "\n").encode('utf-8'))
-                    ser.flush()
-                    last_sent_summary = summary_line
-                    log.info("[SENT->ESP32] %s", summary_line)
-                    sys.stdout.write(f"[SENT->ESP32] {summary_line}\n")
-                    sys.stdout.flush()
-                except Exception as e:
-                    log.warning("Serial write failed: %s", e)
-
-            # ------------------- SIMPLE COLLECT -------------------
-            # Use Code 2 logic: send COLLECT if tracked_count >= threshold
-            if detection_enabled and tracked_count >= args.collect_threshold and ser:
-                try:
-                    ser.write(b'COLLECT\n')
-                    ser.flush()
-                    detection_enabled = False
-                    collect_start_ts = time.time()
-                    log.info("Sent COLLECT command (threshold=%d).", args.collect_threshold)
-                    sys.stdout.write("[SENT->ESP32] COLLECT\n")
-                    sys.stdout.flush()
-                except Exception as e:
-                    log.warning("Failed to send COLLECT: %s", e)
-            # -------------------------------------------------------
-
-            # GUI display
-            if args.show:
-                try:
-                    vis = processed.copy()
-                    for (x1, y1, x2, y2) in det_boxes:
-                        cv2.rectangle(vis, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                    for oid, (centroid, bbox) in objects.items():
-                        cv2.putText(vis, f"ID:{oid}", (centroid[0]-10, centroid[1]-10),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,0,255), 2)
-                        cv2.circle(vis, centroid, 4, (255,0,0), -1)
-                    cv2.imshow("YoloV8 Tracking & Control", vis)
-                    if cv2.waitKey(1) & 0xFF == ord('q'):
-                        break
-                except Exception as e:
-                    log.debug("Display error: %s", e)
-
-    finally:
-        try:
-            cap.release()
-        except Exception:
-            pass
-        if args.show:
-            cv2.destroyAllWindows()
-        if ser:
-            try:
-                ser.close()
-            except Exception:
-                pass
-        log.info("Exiting cleanly.")
 
 if __name__ == "__main__":
-    sys.exit(main())
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--show", action="store_true", help="Show camera output for debugging")
+    args = parser.parse_args()
+    main(show=args.show)
