@@ -236,23 +236,48 @@ def main(show=False):
 
     last_collect_time = 0
     tracked_boxes = deque(maxlen=MAX_TRACK_MEMORY)
+    external_detections = 0          # counts appearance events coming from ESP32
 
     while not stop_requested:
         # read any serial input first (handle DONE or other lines)
         if serman:
             line = serman.safe_readline()
             if line:
-                up = line.strip().upper()
-                if up == "DONE":
-                    if paused:
-                        logging.info("Received DONE -> resuming")
-                        paused = False
-                        tracked_boxes.clear()
-                    else:
-                        logging.info("Received DONE but not paused")
+                # try parse JSON appearance message first (ESP32 now sends {"sensor":"ultrasonic3","event":"appearance",...})
+                parsed_json = None
+                try:
+                    parsed_json = json.loads(line)
+                except Exception:
+                    parsed_json = None
+
+                if parsed_json:
+                    # handle ESP32 appearance events
+                    try:
+                        evt = parsed_json.get("event")
+                        if evt == "appearance":
+                            sensor = parsed_json.get("sensor", "unknown")
+                            dist = parsed_json.get("dist_cm", None)
+                            ts = parsed_json.get("ts", None)
+                            external_detections += 1
+                            logging.info("External appearance from %s dist=%s ts=%s -> external_detections=%d",
+                                         sensor, str(dist), str(ts), external_detections)
+                        else:
+                            logging.info("RX JSON (unhandled): %s", line)
+                    except Exception:
+                        logging.exception("Error handling JSON serial line: %s", line)
                 else:
-                    # log other incoming lines
-                    logging.info("RX (before frame): %s", line)
+                    # fallback to old text commands
+                    up = line.strip().upper()
+                    if up == "DONE":
+                        if paused:
+                            logging.info("Received DONE -> resuming")
+                            paused = False
+                            tracked_boxes.clear()
+                            external_detections = 0        # clear external counts on resume
+                        else:
+                            logging.info("Received DONE but not paused")
+                    else:
+                        logging.info("RX (before frame): %s", line)
 
         if paused:
             # while paused keep checking serial for DONE
@@ -305,6 +330,7 @@ def main(show=False):
                 tracked_boxes.append(cb)
                 debris_count += 1
 
+        # build log data
         log_data = {
             "timestamp": datetime.utcnow().isoformat() + "Z",
             "frame_detected": len(current_boxes),
@@ -322,15 +348,20 @@ def main(show=False):
             if not ok:
                 logging.warning("Failed to write detection payload to serial (will retry later)")
 
-        # check threshold and send COLLECT
-        if debris_count >= DETECTION_THRESHOLD and not paused:
+        # check threshold and send COLLECT (now includes external_detections)
+        total_count = debris_count + external_detections
+        logging.debug("Counts: debris_count=%d external_detections=%d total_count=%d",
+                      debris_count, external_detections, total_count)
+
+        if total_count >= DETECTION_THRESHOLD and not paused:
             now = time.time()
             if now - last_collect_time >= COOLDOWN:
-                logging.info("Threshold reached, sending COLLECT")
+                logging.info("Threshold reached (total_count=%d), sending COLLECT", total_count)
                 if serman:
                     serman.safe_write(b"COLLECT\n")
                 paused = True
                 last_collect_time = now
+                external_detections = 0   # we've acted on the external events; clear them
 
         # small sleep
         time.sleep(0.01)
