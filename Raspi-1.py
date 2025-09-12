@@ -16,6 +16,7 @@ from datetime import datetime
 from ultralytics import YOLO
 from collections import deque
 from serial import SerialException
+import threading
 
 # ----------------------- CONFIGURATION -----------------------
 MODEL_PATH = "/home/Team23/ProjectDesignMain/Project-Design-1/Weights/Tac02.pt"
@@ -28,6 +29,9 @@ COOLDOWN = 10  # seconds
 MAX_TRACK_MEMORY = 50
 IOU_THRESHOLD = 0.3
 
+# Camera / resizing (added)
+CAP_DEVICE = 0
+MAX_SIDE = 640   # resize long side to this before inference (try 480 or 320 if you want more speed)
 # Serial reconnect params
 SERIAL_RECONNECT_MAX_RETRIES = None   # None => retry forever
 SERIAL_RECONNECT_BASE_DELAY = 0.5     # seconds
@@ -55,7 +59,60 @@ def signal_handler(sig, frame):
 signal.signal(signal.SIGINT, signal_handler)
 signal.signal(signal.SIGTERM, signal_handler)
 
-# -------------------- Serial helper with reconnect --------------------
+# -------------------- Threaded camera capture & helpers --------------------
+class CamGrab(threading.Thread):
+    """Non-blocking camera capture running in a background thread.
+    read() returns (ok, frame) where frame is a copy (or None)."""
+    def __init__(self, src=0, width=None, height=None):
+        super().__init__(daemon=True)
+        self.cap = cv2.VideoCapture(src, cv2.CAP_ANY)
+        # optionally set capture resolution
+        if width:
+            self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+        if height:
+            self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+        self.lock = threading.Lock()
+        self.frame = None
+        self.ok = False
+        self.stopped = False
+
+    def run(self):
+        tries = 0
+        while not self.stopped:
+            ok, frame = self.cap.read()
+            with self.lock:
+                self.ok = ok
+                if ok and frame is not None:
+                    self.frame = frame
+            if not ok:
+                tries += 1
+                time.sleep(0.05 if tries < 10 else 0.5)
+            else:
+                time.sleep(0.001)
+
+    def read(self):
+        with self.lock:
+            return self.ok, (self.frame.copy() if self.frame is not None else None)
+
+    def stop(self):
+        self.stopped = True
+        try:
+            self.cap.release()
+        except Exception:
+            pass
+
+def resize_keep_aspect(frame, max_side):
+    """Resize the frame keeping aspect ratio so the long side = max_side."""
+    h, w = frame.shape[:2]
+    maxc = max(h, w)
+    if maxc <= max_side:
+        return frame, 1.0
+    scale = max_side / float(maxc)
+    neww = int(w * scale)
+    newh = int(h * scale)
+    return cv2.resize(frame, (neww, newh)), scale
+
+# ----------------------- SERIAL helper with reconnect --------------------
 class SerialManager:
     def __init__(self, port, baud, timeout=1.0):
         self.port = port
@@ -228,11 +285,21 @@ def main(show=False):
         # proceed, but serman may be None (safe_write will handle it)
         serman = None
 
-    # Camera
-    cap = cv2.VideoCapture(0)
-    if not cap.isOpened():
-        logging.error("Camera not found (device /dev/video0). Exiting.")
-        return
+    # Camera: use threaded grabber (faster and non-blocking)
+    grab = CamGrab(CAP_DEVICE)
+    grab.start()
+
+    # wait for first frame (timeout-safe)
+    t_start = time.time()
+    ok, frame = False, None
+    while True:
+        ok, frame = grab.read()
+        if ok and frame is not None:
+            break
+        if time.time() - t_start > 5.0:
+            logging.warning("Warning: camera didn't produce a frame within 5s. Check CAP_DEVICE.")
+            break
+        time.sleep(0.01)
 
     last_collect_time = 0
     tracked_boxes = deque(maxlen=MAX_TRACK_MEMORY)
@@ -284,16 +351,21 @@ def main(show=False):
             time.sleep(0.05)
             continue
 
-        ret, frame = cap.read()
-        if not ret:
-            logging.warning("camera read failed; retrying")
-            time.sleep(0.05)
+        # get latest frame from grabber
+        ok, frame = grab.read()
+        if not ok or frame is None:
+            time.sleep(0.01)
             continue
 
+        # apply your preprocessing (CLAHE + sharpening)
         frame = preprocess_frame(frame)
 
+        # resize to speed up inference while keeping scale (we operate on the resized frame)
+        small, scale = resize_keep_aspect(frame, MAX_SIDE)
+
         try:
-            results = model(frame, conf=CONF_THRESHOLD, verbose=False)
+            # run inference on the resized (preprocessed) frame
+            results = model(small, conf=CONF_THRESHOLD, verbose=False)
         except Exception as e:
             logging.error("Model inference failed: %s", e)
             time.sleep(0.05)
@@ -321,6 +393,7 @@ def main(show=False):
                 except Exception:
                     coords = box.xyxy.cpu().numpy()[0]
                     x1, y1, x2, y2 = map(int, coords[:4])
+                # coords are in resized (small) frame space — that's fine for tracking/counting
                 current_boxes.append((x1, y1, x2, y2))
                 detected_classes.append(cls_name)
 
@@ -344,8 +417,8 @@ def main(show=False):
 
         # send logs to ESP32 using safe_write
         if serman:
-            ok = serman.safe_write((payload + "\n").encode('utf-8'))
-            if not ok:
+            ok_write = serman.safe_write((payload + "\n").encode('utf-8'))
+            if not ok_write:
                 logging.warning("Failed to write detection payload to serial (will retry later)")
 
         # check threshold and send COLLECT (now includes external_detections)
@@ -368,7 +441,7 @@ def main(show=False):
 
     # cleanup
     try:
-        cap.release()
+        grab.stop()
     except Exception:
         pass
     if serman:
@@ -382,4 +455,3 @@ if __name__ == "__main__":
     parser.add_argument("--show", action="store_true", help="Show camera output for debugging")
     args = parser.parse_args()
     main(show=args.show)
-
