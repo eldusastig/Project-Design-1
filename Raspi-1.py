@@ -48,6 +48,9 @@ logging.basicConfig(
     ]
 )
 
+# If you want verbose debug: uncomment the next line during testing
+# logging.getLogger().setLevel(logging.DEBUG)
+
 stop_requested = False
 paused = False
 
@@ -421,20 +424,49 @@ def main(show=False):
             if not ok_write:
                 logging.warning("Failed to write detection payload to serial (will retry later)")
 
-        # check threshold and send COLLECT (now includes external_detections)
-        total_count = debris_count + external_detections
-        logging.debug("Counts: debris_count=%d external_detections=%d total_count=%d",
-                      debris_count, external_detections, total_count)
+        # ---- Decision & debug block (REPLACED/IMPROVED) ----
+        frame_count = len(current_boxes)                   # objects detected in this frame
+        unique_new = debris_count                          # your existing unique count logic
 
+        # Show both so you can reason about which mode to use
+        logging.debug("DECISION DEBUG: frame_count=%d unique_new=%d tracked_history=%d external_detections=%d paused=%s last_collect_time=%s COOLDOWN=%s",
+                      frame_count, unique_new, len(tracked_boxes), external_detections, paused, last_collect_time, COOLDOWN)
+
+        # Choose mode: frame-based or unique-based
+        # Use frame-based to trigger on the number seen in a frame (more reliable for immediate action)
+        total_count = frame_count + external_detections
+        # If you prefer the older unique logic instead, uncomment the next line:
+        # total_count = unique_new + external_detections
+
+        logging.debug("Using total_count=%d (frame_mode=%d unique_mode=%d)", total_count, frame_count, unique_new)
+
+        # threshold check
         if total_count >= DETECTION_THRESHOLD and not paused:
-            now = time.time()
-            if now - last_collect_time >= COOLDOWN:
-                logging.info("Threshold reached (total_count=%d), sending COLLECT", total_count)
+            now_ts = time.time()
+            if now_ts - last_collect_time >= COOLDOWN:
+                logging.info("Threshold reached (total_count=%d >= %d), attempting COLLECT...", total_count, DETECTION_THRESHOLD)
+
+                write_ok = False
                 if serman:
-                    serman.safe_write(b"COLLECT\n")
-                paused = True
-                last_collect_time = now
-                external_detections = 0   # we've acted on the external events; clear them
+                    try:
+                        write_ok = serman.safe_write(b"COLLECT\n")
+                        logging.info("safe_write(COLLECT) returned: %s", write_ok)
+                    except Exception as e:
+                        logging.exception("safe_write raised exception: %s", e)
+                        write_ok = False
+                else:
+                    logging.warning("No serial manager (serman is None). Cannot write to ESP32.")
+
+                if write_ok:
+                    paused = True
+                    last_collect_time = now_ts
+                    external_detections = 0
+                    tracked_boxes.clear()   # IMPORTANT: clear tracked history so future unique detection isn't blocked
+                    logging.info("Sent COLLECT -> paused=True, last_collect_time updated, tracked_boxes cleared.")
+                else:
+                    logging.warning("COLLECT not sent (serial write failed). Not pausing; will retry after cooldown.")
+            else:
+                logging.debug("Cooldown active: now-last_collect_time=%.3f < COOLDOWN=%d", now_ts - last_collect_time, COOLDOWN)
 
         # small sleep
         time.sleep(0.01)
