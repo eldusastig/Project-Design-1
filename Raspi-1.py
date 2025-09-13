@@ -19,19 +19,19 @@ from serial import SerialException
 import threading
 
 # ----------------------- CONFIGURATION -----------------------
-MODEL_PATH = "/home/Team23/ProjectDesignMain/Project-Design-1/Weights/Tac02.pt"
+MODEL_PATH = "/home/Team23/Desktop/ProjectDesignMain/Project-Design-1/Weights/Tac02.pt"
 SERIAL_PORT = "/dev/ttyUSB0"
 BAUD_RATE = 115200
-DETECTION_THRESHOLD = 4
-CONF_THRESHOLD = 0.5
-LOG_FILE = "/var/log/yolo_debris_service.log"
-COOLDOWN = 10  # seconds
+DETECTION_THRESHOLD = 2
+CONF_THRESHOLD = 0.25
+LOG_FILE = "/home/Team23/Desktop/ProjectDesignMain/Project-Design-1/yolo_debris_service.log"
+COOLDOWN = 3 # seconds
 MAX_TRACK_MEMORY = 50
 IOU_THRESHOLD = 0.3
 
 # Camera / resizing (added)
 CAP_DEVICE = 0
-MAX_SIDE = 640   # resize long side to this before inference (try 480 or 320 if you want more speed)
+MAX_SIDE = 480  # resize long side to this before inference (try 480 or 320 if you want more speed)
 # Serial reconnect params
 SERIAL_RECONNECT_MAX_RETRIES = None   # None => retry forever
 SERIAL_RECONNECT_BASE_DELAY = 0.5     # seconds
@@ -487,3 +487,4 @@ if __name__ == "__main__":
     parser.add_argument("--show", action="store_true", help="Show camera output for debugging")
     args = parser.parse_args()
     main(show=args.show)
+
