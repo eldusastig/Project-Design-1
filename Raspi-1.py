@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """
 yolo_debris_service.py - safe serial with reconnect
+Improvements: lightweight tiled re-check for cluttered/overlapping objects,
+reduced default frame size for Raspberry Pi 4, and NMS merging of tile results.
 """
 
 import cv2
@@ -29,9 +31,16 @@ COOLDOWN = 3 # seconds
 MAX_TRACK_MEMORY = 50
 IOU_THRESHOLD = 0.3
 
-# Camera / resizing (added)
+# Camera / resizing (Pi4: keep small to save CPU)
 CAP_DEVICE = 0
-MAX_SIDE = 480  # resize long side to this before inference (try 480 or 320 if you want more speed)
+MAX_SIDE = 320  # smaller default on Pi4 for better throughput
+
+# Tiling fallback (only used when frame detections < DETECTION_THRESHOLD)
+TILE_SIZE = 320        # tile size in pixels (works on resized frame)
+TILE_OVERLAP = 0.25    # fraction overlap between tiles
+TILE_CONF = 0.20       # per-tile confidence threshold (lower so small/cluttered objects can be found)
+TILE_NMS_IOU = 0.35    # IoU for merging tile boxes
+MAX_TILED_RUNS_PER_MIN = 6  # safety cap to avoid overusing tile mode (per minute)
 # Serial reconnect params
 SERIAL_RECONNECT_MAX_RETRIES = None   # None => retry forever
 SERIAL_RECONNECT_BASE_DELAY = 0.5     # seconds
@@ -48,7 +57,7 @@ logging.basicConfig(
     ]
 )
 
-# If you want verbose debug: uncomment the next line during testing
+# For debugging turn on:
 # logging.getLogger().setLevel(logging.DEBUG)
 
 stop_requested = False
@@ -64,12 +73,10 @@ signal.signal(signal.SIGTERM, signal_handler)
 
 # -------------------- Threaded camera capture & helpers --------------------
 class CamGrab(threading.Thread):
-    """Non-blocking camera capture running in a background thread.
-    read() returns (ok, frame) where frame is a copy (or None)."""
+    """Non-blocking camera capture running in a background thread."""
     def __init__(self, src=0, width=None, height=None):
         super().__init__(daemon=True)
         self.cap = cv2.VideoCapture(src, cv2.CAP_ANY)
-        # optionally set capture resolution
         if width:
             self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
         if height:
@@ -105,7 +112,6 @@ class CamGrab(threading.Thread):
             pass
 
 def resize_keep_aspect(frame, max_side):
-    """Resize the frame keeping aspect ratio so the long side = max_side."""
     h, w = frame.shape[:2]
     maxc = max(h, w)
     if maxc <= max_side:
@@ -126,14 +132,12 @@ class SerialManager:
         self.open_serial_blocking()
 
     def open_serial_blocking(self):
-        """Try to open serial; keep retrying with backoff until success (or until max tries)."""
         delay = SERIAL_RECONNECT_BASE_DELAY
         attempts = 0
         while True:
             try:
                 logging.info("Opening serial %s @ %d ...", self.port, self.baud)
                 self.ser = serial.Serial(self.port, self.baud, timeout=self.timeout, write_timeout=1)
-                # flush any old data
                 try:
                     time.sleep(0.05)
                     self.ser.reset_input_buffer()
@@ -170,9 +174,7 @@ class SerialManager:
             return False
 
     def safe_write(self, data_bytes):
-        """Write bytes to serial with exception handling and reconnect."""
         if not self.ser:
-            # no serial open, attempt reopen
             logging.warning("Serial not open; attempting to open before write.")
             try:
                 self.open_serial_blocking()
@@ -185,7 +187,6 @@ class SerialManager:
         while True:
             try:
                 self.ser.write(data_bytes)
-                # flush to ensure immediate send; ignore errors from flush if any
                 try:
                     self.ser.flush()
                 except Exception:
@@ -193,7 +194,6 @@ class SerialManager:
                 return True
             except SerialException as e:
                 logging.error("Serial write error: %s", e)
-                # try reconnecting once with backoff
                 time.sleep(delay)
                 success = self.reconnect()
                 if not success:
@@ -204,7 +204,6 @@ class SerialManager:
                     delay = min(delay * 1.7, SERIAL_RECONNECT_MAX_DELAY)
                     continue
                 else:
-                    # after reconnect try write one more time
                     try:
                         self.ser.write(data_bytes)
                         try:
@@ -214,7 +213,6 @@ class SerialManager:
                         return True
                     except SerialException as e2:
                         logging.error("Serial write still failing after reconnect: %s", e2)
-                        # continue loop to reconnect again
                         attempt += 1
                         if SERIAL_RECONNECT_MAX_RETRIES is not None and attempt >= SERIAL_RECONNECT_MAX_RETRIES:
                             return False
@@ -226,7 +224,6 @@ class SerialManager:
                 return False
 
     def safe_readline(self):
-        """Non-blocking read of a single line (returns decoded str or None)."""
         if not self.ser:
             return None
         try:
@@ -241,15 +238,15 @@ class SerialManager:
                 return None
         except SerialException as e:
             logging.error("Serial read error: %s", e)
-            # try reconnect
             self.reconnect()
             return None
         except Exception as e:
             logging.exception("Unexpected error during serial read: %s", e)
             return None
 
-# ----------------------- UTILITIES (unchanged) -----------------------
+# ----------------------- UTILITIES -----------------------
 def preprocess_frame(frame):
+    # CLAHE + sharpening (keeps your original improvements)
     lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
     l, a, b = cv2.split(lab)
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
@@ -258,6 +255,8 @@ def preprocess_frame(frame):
     frame = cv2.cvtColor(merged, cv2.COLOR_LAB2BGR)
     kernel = np.array([[0, -1, 0], [-1, 5, -1], [0, -1, 0]])
     frame = cv2.filter2D(frame, -1, kernel)
+    # small denoise can help clustering separation in noisy Pi captures
+    frame = cv2.fastNlMeansDenoisingColored(frame, None, 3, 3, 7, 21)
     return frame
 
 def compute_iou(box1, box2):
@@ -269,7 +268,143 @@ def compute_iou(box1, box2):
         return 0.0
     intersection = (inter_x2 - inter_x1) * (inter_y2 - inter_y1)
     union = ((x2 - x1) * (y2 - y1)) + ((x2b - x1b) * (y2b - y1b)) - intersection
+    if union <= 0:
+        return 0.0
     return intersection / union
+
+def nms_merge(boxes, scores, iou_thresh=0.45, score_thresh=0.0):
+    """Return indices of boxes kept after NMS (cv2.dnn.NMSBoxes)."""
+    if len(boxes) == 0:
+        return []
+    boxes_xywh = []
+    for b in boxes:
+        x1, y1, x2, y2 = b
+        boxes_xywh.append([float(x1), float(y1), float(max(1.0, x2 - x1)), float(max(1.0, y2 - y1))])
+    # cv2.dnn.NMSBoxes returns indices
+    try:
+        idxs = cv2.dnn.NMSBoxes(boxes_xywh, scores, score_thresh, iou_thresh)
+    except Exception:
+        # fallback to simple greedy NMS if cv2 fails
+        idxs = []
+        order = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)
+        keep = []
+        for i in order:
+            keep_i = True
+            for j in keep:
+                if compute_iou(boxes[i], boxes[j]) > iou_thresh:
+                    keep_i = False
+                    break
+            if keep_i:
+                keep.append(i)
+        return keep
+    keep = []
+    if isinstance(idxs, (list, tuple)):
+        # e.g. list of lists on some builds
+        for it in idxs:
+            if isinstance(it, (list, tuple, np.ndarray)):
+                if len(it) > 0:
+                    keep.append(int(it[0]))
+            else:
+                keep.append(int(it))
+    elif isinstance(idxs, np.ndarray):
+        keep = idxs.flatten().astype(int).tolist()
+    else:
+        try:
+            keep = list(idxs)
+        except Exception:
+            keep = []
+    return keep
+
+# ----------------------- Inference helpers -----------------------
+def run_model_on_image(model, img, conf):
+    """Run model on a single image (numpy BGR). Return boxes, scores, classes."""
+    try:
+        results = model(img, conf=conf, verbose=False)
+    except Exception as e:
+        logging.exception("Model inference error: %s", e)
+        return [], [], []
+    r = results[0]
+    boxes = []
+    scores = []
+    classes = []
+    try:
+        bobj = r.boxes
+        if bobj is None or len(bobj) == 0:
+            return [], [], []
+        # unify types
+        xyxy = bobj.xyxy
+        confs = bobj.conf
+        clss = bobj.cls
+        if hasattr(xyxy, "cpu"):
+            xyxy = xyxy.cpu().numpy()
+            confs = confs.cpu().numpy()
+            clss = clss.cpu().numpy()
+        else:
+            xyxy = np.array(xyxy)
+            confs = np.array(confs)
+            clss = np.array(clss)
+        for i in range(xyxy.shape[0]):
+            x1, y1, x2, y2 = xyxy[i][:4].astype(int).tolist()
+            confv = float(confs[i])
+            clsid = int(clss[i])
+            boxes.append((x1, y1, x2, y2))
+            scores.append(confv)
+            classes.append(clsid)
+    except Exception as e:
+        logging.exception("Failed to extract boxes from results: %s", e)
+    return boxes, scores, classes
+
+def make_tiles(frame_w, frame_h, tile_size=TILE_SIZE, overlap=TILE_OVERLAP):
+    step = int(tile_size * (1.0 - overlap))
+    if step <= 0:
+        step = tile_size // 2
+    xs = list(range(0, max(1, frame_w - tile_size + 1), step))
+    ys = list(range(0, max(1, frame_h - tile_size + 1), step))
+    if len(xs) == 0 or xs[-1] + tile_size < frame_w:
+        xs.append(max(0, frame_w - tile_size))
+    if len(ys) == 0 or ys[-1] + tile_size < frame_h:
+        ys.append(max(0, frame_h - tile_size))
+    tiles = []
+    for y in ys:
+        for x in xs:
+            w = min(tile_size, frame_w - x)
+            h = min(tile_size, frame_h - y)
+            tiles.append((x, y, w, h))
+    return tiles
+
+def tile_inference_and_merge(model, small_img):
+    """Run inference on tiles of small_img, map results to small_img coords and merge via NMS."""
+    h, w = small_img.shape[:2]
+    tiles = make_tiles(w, h, tile_size=TILE_SIZE, overlap=TILE_OVERLAP)
+    all_boxes = []
+    all_scores = []
+    all_classes = []
+    for (tx, ty, tw, th) in tiles:
+        crop = small_img[ty:ty+th, tx:tx+tw]
+        if crop is None or crop.size == 0:
+            continue
+        # run model on crop with lower conf so we catch small/cluttered objects
+        boxes, scores, classes = run_model_on_image(model, crop, conf=TILE_CONF)
+        for b, s, c in zip(boxes, scores, classes):
+            x1, y1, x2, y2 = b
+            # map to small_img coordinates
+            x1f, y1f, x2f, y2f = x1 + tx, y1 + ty, x2 + tx, y2 + ty
+            # clamp
+            x1f = max(0, min(w-1, x1f)); y1f = max(0, min(h-1, y1f))
+            x2f = max(0, min(w-1, x2f)); y2f = max(0, min(h-1, y2f))
+            if x2f <= x1f or y2f <= y1f:
+                continue
+            all_boxes.append((int(x1f), int(y1f), int(x2f), int(y2f)))
+            all_scores.append(float(s))
+            all_classes.append(int(c))
+    if len(all_boxes) == 0:
+        return [], [], []
+    # NMS merge with tile-level IoU threshold
+    keep = nms_merge(all_boxes, all_scores, iou_thresh=TILE_NMS_IOU, score_thresh=TILE_CONF)
+    kept_boxes = [all_boxes[i] for i in keep]
+    kept_scores = [all_scores[i] for i in keep]
+    kept_classes = [all_classes[i] for i in keep]
+    return kept_boxes, kept_scores, kept_classes
 
 # ----------------------- MAIN LOGIC -----------------------
 def main(show=False):
@@ -285,14 +420,12 @@ def main(show=False):
         serman = SerialManager(SERIAL_PORT, BAUD_RATE, timeout=0.1)
     except Exception as e:
         logging.error("Failed to initialize SerialManager: %s", e)
-        # proceed, but serman may be None (safe_write will handle it)
         serman = None
 
-    # Camera: use threaded grabber (faster and non-blocking)
+    # Camera: use threaded grabber
     grab = CamGrab(CAP_DEVICE)
     grab.start()
 
-    # wait for first frame (timeout-safe)
     t_start = time.time()
     ok, frame = False, None
     while True:
@@ -306,22 +439,20 @@ def main(show=False):
 
     last_collect_time = 0
     tracked_boxes = deque(maxlen=MAX_TRACK_MEMORY)
-    external_detections = 0          # counts appearance events coming from ESP32
+    external_detections = 0
+    tiled_runs = deque()  # timestamps of latest tiled runs (rate-limited)
 
     while not stop_requested:
-        # read any serial input first (handle DONE or other lines)
+        # read serial input
         if serman:
             line = serman.safe_readline()
             if line:
-                # try parse JSON appearance message first (ESP32 now sends {"sensor":"ultrasonic3","event":"appearance",...})
                 parsed_json = None
                 try:
                     parsed_json = json.loads(line)
                 except Exception:
                     parsed_json = None
-
                 if parsed_json:
-                    # handle ESP32 appearance events
                     try:
                         evt = parsed_json.get("event")
                         if evt == "appearance":
@@ -336,86 +467,90 @@ def main(show=False):
                     except Exception:
                         logging.exception("Error handling JSON serial line: %s", line)
                 else:
-                    # fallback to old text commands
                     up = line.strip().upper()
                     if up == "DONE":
                         if paused:
                             logging.info("Received DONE -> resuming")
                             paused = False
                             tracked_boxes.clear()
-                            external_detections = 0        # clear external counts on resume
+                            external_detections = 0
                         else:
                             logging.info("Received DONE but not paused")
                     else:
                         logging.info("RX (before frame): %s", line)
 
         if paused:
-            # while paused keep checking serial for DONE
             time.sleep(0.05)
             continue
 
-        # get latest frame from grabber
         ok, frame = grab.read()
         if not ok or frame is None:
             time.sleep(0.01)
             continue
 
-        # apply your preprocessing (CLAHE + sharpening)
+        # preprocess
         frame = preprocess_frame(frame)
 
-        # resize to speed up inference while keeping scale (we operate on the resized frame)
+        # resize to speed up inference
         small, scale = resize_keep_aspect(frame, MAX_SIDE)
 
-        try:
-            # run inference on the resized (preprocessed) frame
-            results = model(small, conf=CONF_THRESHOLD, verbose=False)
-        except Exception as e:
-            logging.error("Model inference failed: %s", e)
-            time.sleep(0.05)
-            continue
+        # inference on resized frame
+        boxes, scores, classes = run_model_on_image(model, small, conf=CONF_THRESHOLD)
+        frame_boxes = boxes
+        frame_scores = scores
+        frame_classes = classes
 
-        detections = results[0].boxes
-        current_boxes = []
-        detected_classes = []
+        frame_count = len(frame_boxes)
+        detected_classes_names = [model.names.get(c, str(c)) for c in frame_classes]
+
+        # If frame detections are fewer than the threshold, try the tiled fallback (rate-limited)
+        nowt = time.time()
+        tiled_allowed = True
+        # purge old timestamps older than 60s
+        while tiled_runs and tiled_runs[0] < nowt - 60.0:
+            tiled_runs.popleft()
+        if len(tiled_runs) >= MAX_TILED_RUNS_PER_MIN:
+            tiled_allowed = False
+
+        if frame_count < DETECTION_THRESHOLD and tiled_allowed:
+            logging.debug("Frame detections (%d) < threshold (%d); running tiled fallback...",
+                          frame_count, DETECTION_THRESHOLD)
+            tiled_boxes, tiled_scores, tiled_classes = tile_inference_and_merge(model, small)
+            tiled_runs.append(nowt)
+            if len(tiled_boxes) > 0:
+                # Merge frame boxes + tiled boxes and NMS
+                merged_boxes = frame_boxes[:] + tiled_boxes
+                merged_scores = frame_scores[:] + tiled_scores
+                merged_classes = frame_classes[:] + tiled_classes
+                keep = nms_merge(merged_boxes, merged_scores, iou_thresh=0.45, score_thresh=min(CONF_THRESHOLD, TILE_CONF))
+                merged_boxes = [merged_boxes[i] for i in keep]
+                merged_scores = [merged_scores[i] for i in keep]
+                merged_classes = [merged_classes[i] for i in keep]
+                frame_boxes = merged_boxes
+                frame_scores = merged_scores
+                frame_classes = merged_classes
+                detected_classes_names = [model.names.get(c, str(c)) for c in frame_classes]
+                frame_count = len(frame_boxes)
+                logging.info("After tiled merge: frame_count=%d", frame_count)
+            else:
+                logging.debug("Tiled pass found nothing new.")
+
+        # Unique count using IoU against tracked history (existing logic)
         debris_count = 0
-
-        for box in detections:
-            # many ultralytics Box objects provide `.cls`, `.conf`, `.xyxy`
-            try:
-                cls_id = int(box.cls[0])
-                cls_name = model.names.get(cls_id, str(cls_id))
-            except Exception:
-                cls_name = "unknown"
-            try:
-                conf = float(box.conf[0])
-            except Exception:
-                conf = 0.0
-            if conf >= CONF_THRESHOLD:
-                try:
-                    x1, y1, x2, y2 = map(int, box.xyxy[0])
-                except Exception:
-                    coords = box.xyxy.cpu().numpy()[0]
-                    x1, y1, x2, y2 = map(int, coords[:4])
-                # coords are in resized (small) frame space — that's fine for tracking/counting
-                current_boxes.append((x1, y1, x2, y2))
-                detected_classes.append(cls_name)
-
-        # Unique count using IoU against tracked history
-        for cb in current_boxes:
+        for cb in frame_boxes:
             if not any(compute_iou(cb, tb) > IOU_THRESHOLD for tb in tracked_boxes):
                 tracked_boxes.append(cb)
                 debris_count += 1
 
-        # build log data
+        # build log
         log_data = {
             "timestamp": datetime.utcnow().isoformat() + "Z",
-            "frame_detected": len(current_boxes),
+            "frame_detected": len(frame_boxes),
             "unique_detected": debris_count,
             "threshold": DETECTION_THRESHOLD,
-            "classes": detected_classes
+            "classes": detected_classes_names
         }
         payload = json.dumps(log_data, ensure_ascii=True)
-
         logging.info(payload)
 
         # send logs to ESP32 using safe_write
@@ -424,28 +559,14 @@ def main(show=False):
             if not ok_write:
                 logging.warning("Failed to write detection payload to serial (will retry later)")
 
-        # ---- Decision & debug block (REPLACED/IMPROVED) ----
-        frame_count = len(current_boxes)                   # objects detected in this frame
-        unique_new = debris_count                          # your existing unique count logic
+        # Decision: use frame_count (immediate) + external detections
+        total_count = len(frame_boxes) + external_detections
+        logging.debug("DECISION: frame_count=%d external=%d total=%d", len(frame_boxes), external_detections, total_count)
 
-        # Show both so you can reason about which mode to use
-        logging.debug("DECISION DEBUG: frame_count=%d unique_new=%d tracked_history=%d external_detections=%d paused=%s last_collect_time=%s COOLDOWN=%s",
-                      frame_count, unique_new, len(tracked_boxes), external_detections, paused, last_collect_time, COOLDOWN)
-
-        # Choose mode: frame-based or unique-based
-        # Use frame-based to trigger on the number seen in a frame (more reliable for immediate action)
-        total_count = frame_count + external_detections
-        # If you prefer the older unique logic instead, uncomment the next line:
-        # total_count = unique_new + external_detections
-
-        logging.debug("Using total_count=%d (frame_mode=%d unique_mode=%d)", total_count, frame_count, unique_new)
-
-        # threshold check
         if total_count >= DETECTION_THRESHOLD and not paused:
             now_ts = time.time()
             if now_ts - last_collect_time >= COOLDOWN:
-                logging.info("Threshold reached (total_count=%d >= %d), attempting COLLECT...", total_count, DETECTION_THRESHOLD)
-
+                logging.info("Threshold reached (total=%d), attempting COLLECT...", total_count)
                 write_ok = False
                 if serman:
                     try:
@@ -456,19 +577,17 @@ def main(show=False):
                         write_ok = False
                 else:
                     logging.warning("No serial manager (serman is None). Cannot write to ESP32.")
-
                 if write_ok:
                     paused = True
                     last_collect_time = now_ts
                     external_detections = 0
-                    tracked_boxes.clear()   # IMPORTANT: clear tracked history so future unique detection isn't blocked
-                    logging.info("Sent COLLECT -> paused=True, last_collect_time updated, tracked_boxes cleared.")
+                    tracked_boxes.clear()
+                    logging.info("Sent COLLECT -> paused=True, cleared tracked history.")
                 else:
                     logging.warning("COLLECT not sent (serial write failed). Not pausing; will retry after cooldown.")
             else:
-                logging.debug("Cooldown active: now-last_collect_time=%.3f < COOLDOWN=%d", now_ts - last_collect_time, COOLDOWN)
+                logging.debug("Cooldown active; waiting.")
 
-        # small sleep
         time.sleep(0.01)
 
     # cleanup
@@ -487,4 +606,3 @@ if __name__ == "__main__":
     parser.add_argument("--show", action="store_true", help="Show camera output for debugging")
     args = parser.parse_args()
     main(show=args.show)
-
