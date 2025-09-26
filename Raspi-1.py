@@ -500,6 +500,16 @@ def main(show=False):
         frame_scores = scores
         frame_classes = classes
 
+        # --- Log model detections on resized frame so journalctl shows them ---
+        try:
+            if len(frame_boxes) > 0:
+                dets = [f"{model.names.get(c, str(c))}:{s:.2f}@{b}" for b, s, c in zip(frame_boxes, frame_scores, frame_classes)]
+                logging.info("Model detections (resized): %s", "; ".join(dets))
+            else:
+                logging.info("Model detections (resized): none")
+        except Exception:
+            logging.exception("Failed to build detection debug string")
+
         frame_count = len(frame_boxes)
         detected_classes_names = [model.names.get(c, str(c)) for c in frame_classes]
 
@@ -532,6 +542,16 @@ def main(show=False):
                 detected_classes_names = [model.names.get(c, str(c)) for c in frame_classes]
                 frame_count = len(frame_boxes)
                 logging.info("After tiled merge: frame_count=%d", frame_count)
+
+                # --- Log merged/tiled detections as well ---
+                try:
+                    if len(frame_boxes) > 0:
+                        dets2 = [f"{model.names.get(c, str(c))}:{s:.2f}@{b}" for b, s, c in zip(frame_boxes, frame_scores, frame_classes)]
+                        logging.info("Model detections (after tiled merge): %s", "; ".join(dets2))
+                    else:
+                        logging.info("Model detections (after tiled merge): none")
+                except Exception:
+                    logging.exception("Failed to build detection debug string after tiled merge")
             else:
                 logging.debug("Tiled pass found nothing new.")
 
@@ -553,11 +573,16 @@ def main(show=False):
         payload = json.dumps(log_data, ensure_ascii=True)
         logging.info(payload)
 
-        # send logs to ESP32 using safe_write
+        # send logs to ESP32 using safe_write (log the payload and the result)
         if serman:
-            ok_write = serman.safe_write((payload + "\n").encode('utf-8'))
-            if not ok_write:
-                logging.warning("Failed to write detection payload to serial (will retry later)")
+            try:
+                logging.info("Writing detection payload to serial: %s", payload)
+                ok_write = serman.safe_write((payload + "\n").encode('utf-8'))
+                logging.info("Serial write result: %s", ok_write)
+                if not ok_write:
+                    logging.warning("Failed to write detection payload to serial (will retry later)")
+            except Exception as e:
+                logging.exception("Exception while writing detection payload to serial: %s", e)
 
         # Decision: use frame_count (immediate) + external detections
         total_count = len(frame_boxes) + external_detections
@@ -570,6 +595,7 @@ def main(show=False):
                 write_ok = False
                 if serman:
                     try:
+                        logging.info("Sending COLLECT to serial")
                         write_ok = serman.safe_write(b"COLLECT\n")
                         logging.info("safe_write(COLLECT) returned: %s", write_ok)
                     except Exception as e:
