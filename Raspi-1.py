@@ -452,8 +452,20 @@ def main(show=False):
                     parsed_json = json.loads(line)
                 except Exception:
                     parsed_json = None
+
+                # If not directly JSON, attempt to extract JSON substring (e.g. "Published detection: {...}")
+                if parsed_json is None:
+                    try:
+                        idx = line.find('{')
+                        if idx != -1:
+                            sub = line[idx:]
+                            parsed_json = json.loads(sub)
+                    except Exception:
+                        parsed_json = None
+
                 if parsed_json:
                     try:
+                        # existing event handling (appearance events)
                         evt = parsed_json.get("event")
                         if evt == "appearance":
                             sensor = parsed_json.get("sensor", "unknown")
@@ -462,6 +474,16 @@ def main(show=False):
                             external_detections += 1
                             logging.info("External appearance from %s dist=%s ts=%s -> external_detections=%d",
                                          sensor, str(dist), str(ts), external_detections)
+                        # new: accept YOLO detection log shape and treat it as external detections
+                        elif ("frame_detected" in parsed_json) or ("unique_detected" in parsed_json):
+                            # prefer unique_detected if present
+                            ud = int(parsed_json.get("unique_detected", parsed_json.get("frame_detected", 0) or 0))
+                            # add to our external counter
+                            external_detections += ud
+                            logging.info("Received detection log from RasPi: frame_detected=%s unique_detected=%s classes=%s -> added %d external_detections (now %d)",
+                                         str(parsed_json.get("frame_detected")),
+                                         str(parsed_json.get("unique_detected")),
+                                         str(parsed_json.get("classes")), ud, external_detections)
                         else:
                             logging.info("RX JSON (unhandled): %s", line)
                     except Exception:
