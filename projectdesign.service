@@ -1,0 +1,16 @@
+[UNIT]
+Description=ProjectDesignMain startup
+After=dev-video0.device network.target
+Requires=dev.video0.device
+
+[Service]
+Type=simple
+user=Team23
+WorkingDirectory=/home/Team23/Desktop/ProjectDesignMain
+ExecStart=/home/Team23/Desktop/ProjectDesignMain/Project-Design-1/project.sh
+Restart=on-failure
+Environment="PYTHONUNBUFFERED=1"
+StandardOutput=journal
+StandardError=journal
+[Install]
+WantedBy=default.target

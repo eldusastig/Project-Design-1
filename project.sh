@@ -1,9 +1,10 @@
-#bin/bash
+#!/bin/bash
 set -euo pipefail
 
 
-cd ~/Desktop/ProjectDesignMain
-source .venv/bin/activate 
+source /home/Team23/Desktop/ProjectDesignMain/.venv/bin/activate
+ 
 echo $(which python3)
 
-python3 Project-Design-1/main.py
+/home/Team23/Desktop/ProjectDesignMain/.venv/bin/python3 \
+ /home/Team23/Desktop/ProjectDesignMain/Project-Design-1/Raspi-1.py
