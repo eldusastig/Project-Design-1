@@ -3,6 +3,9 @@
 yolo_debris_service.py - safe serial with reconnect
 Improvements: lightweight tiled re-check for cluttered/overlapping objects,
 reduced default frame size for Raspberry Pi 4, and NMS merging of tile results.
+
+MOD: if an animal class is detected (by name or by configured numeric ID),
+     the service will NOT send the "COLLECT" command.
 """
 
 import cv2
@@ -45,6 +48,15 @@ MAX_TILED_RUNS_PER_MIN = 6  # safety cap to avoid overusing tile mode (per minut
 SERIAL_RECONNECT_MAX_RETRIES = None   # None => retry forever
 SERIAL_RECONNECT_BASE_DELAY = 0.5     # seconds
 SERIAL_RECONNECT_MAX_DELAY = 5.0      # seconds
+
+# --- Animal detection filter (customize to your model) ---
+# If your model uses numeric class IDs you can add them here:
+ANIMAL_CLASS_IDS = set()  # e.g. {15, 16} if those IDs correspond to animals in your model
+
+# Keywords to match against model class *names* (lowercased). Add or remove as needed.
+ANIMAL_KEYWORDS = {
+ "animal","animals"
+}
 # -------------------------------------------------------------
 
 # Initialize logging for systemd (journald) and file
@@ -441,6 +453,25 @@ def main(show=False):
     tracked_boxes = deque(maxlen=MAX_TRACK_MEMORY)
     external_detections = 0
     tiled_runs = deque()  # timestamps of latest tiled runs (rate-limited)
+    external_animal_detected = False  # if external serial message indicates animal presence
+
+    # helper: check whether a class (by id or name) is an 'animal' per our config
+    def is_animal_from_id_or_name(class_id, class_name=None):
+        # Check numeric id first
+        try:
+            if int(class_id) in ANIMAL_CLASS_IDS:
+                return True
+        except Exception:
+            pass
+        if class_name:
+            cn = class_name.lower()
+            # exact match or keyword substring
+            if cn in ANIMAL_KEYWORDS:
+                return True
+            for kw in ANIMAL_KEYWORDS:
+                if kw in cn:
+                    return True
+        return False
 
     while not stop_requested:
         # read serial input
@@ -474,6 +505,35 @@ def main(show=False):
                             external_detections += 1
                             logging.info("External appearance from %s dist=%s ts=%s -> external_detections=%d",
                                          sensor, str(dist), str(ts), external_detections)
+                            # Check any class info in the message for animals
+                            classes_field = parsed_json.get("classes")
+                            if classes_field:
+                                # classes could be list of names or list of ids or a single value
+                                try:
+                                    if isinstance(classes_field, (list, tuple)):
+                                        for item in classes_field:
+                                            if isinstance(item, str):
+                                                if is_animal_from_id_or_name(None, item):
+                                                    external_animal_detected = True
+                                                    logging.info("External message indicates animal class '%s'", item)
+                                                    break
+                                            else:
+                                                if is_animal_from_id_or_name(item, None):
+                                                    external_animal_detected = True
+                                                    logging.info("External message indicates animal class id '%s'", str(item))
+                                                    break
+                                    elif isinstance(classes_field, str):
+                                        if is_animal_from_id_or_name(None, classes_field):
+                                            external_animal_detected = True
+                                            logging.info("External message indicates animal class '%s'", classes_field)
+                                    else:
+                                        # maybe a number
+                                        if is_animal_from_id_or_name(classes_field, None):
+                                            external_animal_detected = True
+                                            logging.info("External message indicates animal class id '%s'", str(classes_field))
+                                except Exception:
+                                    pass
+
                         # new: accept YOLO detection log shape and treat it as external detections
                         elif ("frame_detected" in parsed_json) or ("unique_detected" in parsed_json):
                             # prefer unique_detected if present
@@ -484,6 +544,32 @@ def main(show=False):
                                          str(parsed_json.get("frame_detected")),
                                          str(parsed_json.get("unique_detected")),
                                          str(parsed_json.get("classes")), ud, external_detections)
+                            # check classes field for animal presence
+                            classes_field = parsed_json.get("classes")
+                            if classes_field:
+                                try:
+                                    if isinstance(classes_field, (list, tuple)):
+                                        for item in classes_field:
+                                            if isinstance(item, str):
+                                                if is_animal_from_id_or_name(None, item):
+                                                    external_animal_detected = True
+                                                    logging.info("External detection log indicates animal class '%s'", item)
+                                                    break
+                                            else:
+                                                if is_animal_from_id_or_name(item, None):
+                                                    external_animal_detected = True
+                                                    logging.info("External detection log indicates animal class id '%s'", str(item))
+                                                    break
+                                    elif isinstance(classes_field, str):
+                                        if is_animal_from_id_or_name(None, classes_field):
+                                            external_animal_detected = True
+                                            logging.info("External detection log indicates animal class '%s'", classes_field)
+                                    else:
+                                        if is_animal_from_id_or_name(classes_field, None):
+                                            external_animal_detected = True
+                                            logging.info("External detection log indicates animal class id '%s'", str(classes_field))
+                                except Exception:
+                                    pass
                         else:
                             logging.info("RX JSON (unhandled): %s", line)
                     except Exception:
@@ -496,6 +582,7 @@ def main(show=False):
                             paused = False
                             tracked_boxes.clear()
                             external_detections = 0
+                            external_animal_detected = False
                         else:
                             logging.info("Received DONE but not paused")
                     else:
@@ -535,6 +622,18 @@ def main(show=False):
         frame_count = len(frame_boxes)
         detected_classes_names = [model.names.get(c, str(c)) for c in frame_classes]
 
+        # Determine if any detected classes are animals (from model output)
+        animal_detected = False
+        try:
+            for cid in frame_classes:
+                name = model.names.get(cid, str(cid)).lower()
+                if is_animal_from_id_or_name(cid, name):
+                    animal_detected = True
+                    logging.info("Animal detected in frame: class_id=%s name=%s", str(cid), name)
+                    break
+        except Exception:
+            pass
+
         # If frame detections are fewer than the threshold, try the tiled fallback (rate-limited)
         nowt = time.time()
         tiled_allowed = True
@@ -565,6 +664,17 @@ def main(show=False):
                 frame_count = len(frame_boxes)
                 logging.info("After tiled merge: frame_count=%d", frame_count)
 
+                # Update animal_detected flag with tiled results as well
+                try:
+                    for cid in frame_classes:
+                        name = model.names.get(cid, str(cid)).lower()
+                        if is_animal_from_id_or_name(cid, name):
+                            animal_detected = True
+                            logging.info("Animal detected after tiled merge: class_id=%s name=%s", str(cid), name)
+                            break
+                except Exception:
+                    pass
+
                 # --- Log merged/tiled detections as well ---
                 try:
                     if len(frame_boxes) > 0:
@@ -590,7 +700,8 @@ def main(show=False):
             "frame_detected": len(frame_boxes),
             "unique_detected": debris_count,
             "threshold": DETECTION_THRESHOLD,
-            "classes": detected_classes_names
+            "classes": detected_classes_names,
+            "animal_detected": bool(animal_detected or external_animal_detected)  # include external flag too
         }
         payload = json.dumps(log_data, ensure_ascii=True)
         logging.info(payload)
@@ -608,9 +719,13 @@ def main(show=False):
 
         # Decision: use frame_count (immediate) + external detections
         total_count = len(frame_boxes) + external_detections
-        logging.debug("DECISION: frame_count=%d external=%d total=%d", len(frame_boxes), external_detections, total_count)
+        logging.debug("DECISION: frame_count=%d external=%d total=%d animal=%s external_animal=%s",
+                      len(frame_boxes), external_detections, total_count, animal_detected, external_animal_detected)
 
-        if total_count >= DETECTION_THRESHOLD and not paused:
+        # NEW: do not send COLLECT if an animal was detected (either in-frame or reported externally)
+        any_animal_flag = bool(animal_detected or external_animal_detected)
+
+        if total_count >= DETECTION_THRESHOLD and not paused and not any_animal_flag:
             now_ts = time.time()
             if now_ts - last_collect_time >= COOLDOWN:
                 logging.info("Threshold reached (total=%d), attempting COLLECT...", total_count)
@@ -629,12 +744,16 @@ def main(show=False):
                     paused = True
                     last_collect_time = now_ts
                     external_detections = 0
+                    external_animal_detected = False
                     tracked_boxes.clear()
                     logging.info("Sent COLLECT -> paused=True, cleared tracked history.")
                 else:
                     logging.warning("COLLECT not sent (serial write failed). Not pausing; will retry after cooldown.")
             else:
                 logging.debug("Cooldown active; waiting.")
+        else:
+            if any_animal_flag and total_count >= DETECTION_THRESHOLD:
+                logging.info("Threshold reached but animal detected -> skipping COLLECT (total=%d)", total_count)
 
         time.sleep(0.01)
 
