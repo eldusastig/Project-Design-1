@@ -4,8 +4,9 @@ yolo_debris_service.py - safe serial with reconnect
 Improvements: lightweight tiled re-check for cluttered/overlapping objects,
 reduced default frame size for Raspberry Pi 4, and NMS merging of tile results.
 
-MOD: if an animal class is detected (by name or by configured numeric ID),
+MOD: if an animal class is detected (by name / keyword),
      the service will NOT send the "COLLECT" command.
+     NOTE: numeric class-id matching has been removed per request.
 """
 
 import cv2
@@ -50,12 +51,10 @@ SERIAL_RECONNECT_BASE_DELAY = 0.5     # seconds
 SERIAL_RECONNECT_MAX_DELAY = 5.0      # seconds
 
 # --- Animal detection filter (customize to your model) ---
-# If your model uses numeric class IDs you can add them here:
-ANIMAL_CLASS_IDS = set()  # e.g. {15, 16} if those IDs correspond to animals in your model
-
+# Numeric ID matching removed intentionally.
 # Keywords to match against model class *names* (lowercased). Add or remove as needed.
 ANIMAL_KEYWORDS = {
- "animal","animals"
+    "animal", "animals"
 }
 # -------------------------------------------------------------
 
@@ -455,22 +454,16 @@ def main(show=False):
     tiled_runs = deque()  # timestamps of latest tiled runs (rate-limited)
     external_animal_detected = False  # if external serial message indicates animal presence
 
-    # helper: check whether a class (by id or name) is an 'animal' per our config
-    def is_animal_from_id_or_name(class_id, class_name=None):
-        # Check numeric id first
-        try:
-            if int(class_id) in ANIMAL_CLASS_IDS:
+    # helper: check whether a class (by name) is an 'animal' per our config
+    def is_animal_from_name(class_name):
+        if not class_name:
+            return False
+        cn = str(class_name).lower()
+        if cn in ANIMAL_KEYWORDS:
+            return True
+        for kw in ANIMAL_KEYWORDS:
+            if kw in cn:
                 return True
-        except Exception:
-            pass
-        if class_name:
-            cn = class_name.lower()
-            # exact match or keyword substring
-            if cn in ANIMAL_KEYWORDS:
-                return True
-            for kw in ANIMAL_KEYWORDS:
-                if kw in cn:
-                    return True
         return False
 
     while not stop_requested:
@@ -505,32 +498,22 @@ def main(show=False):
                             external_detections += 1
                             logging.info("External appearance from %s dist=%s ts=%s -> external_detections=%d",
                                          sensor, str(dist), str(ts), external_detections)
-                            # Check any class info in the message for animals
+                            # Check any class info in the message for animals (name-only)
                             classes_field = parsed_json.get("classes")
                             if classes_field:
-                                # classes could be list of names or list of ids or a single value
                                 try:
                                     if isinstance(classes_field, (list, tuple)):
                                         for item in classes_field:
                                             if isinstance(item, str):
-                                                if is_animal_from_id_or_name(None, item):
+                                                if is_animal_from_name(item):
                                                     external_animal_detected = True
                                                     logging.info("External message indicates animal class '%s'", item)
                                                     break
-                                            else:
-                                                if is_animal_from_id_or_name(item, None):
-                                                    external_animal_detected = True
-                                                    logging.info("External message indicates animal class id '%s'", str(item))
-                                                    break
+                                            # ignore numeric ids (no numeric-id matching anymore)
                                     elif isinstance(classes_field, str):
-                                        if is_animal_from_id_or_name(None, classes_field):
+                                        if is_animal_from_name(classes_field):
                                             external_animal_detected = True
                                             logging.info("External message indicates animal class '%s'", classes_field)
-                                    else:
-                                        # maybe a number
-                                        if is_animal_from_id_or_name(classes_field, None):
-                                            external_animal_detected = True
-                                            logging.info("External message indicates animal class id '%s'", str(classes_field))
                                 except Exception:
                                     pass
 
@@ -544,30 +527,22 @@ def main(show=False):
                                          str(parsed_json.get("frame_detected")),
                                          str(parsed_json.get("unique_detected")),
                                          str(parsed_json.get("classes")), ud, external_detections)
-                            # check classes field for animal presence
+                            # check classes field for animal presence (name-only)
                             classes_field = parsed_json.get("classes")
                             if classes_field:
                                 try:
                                     if isinstance(classes_field, (list, tuple)):
                                         for item in classes_field:
                                             if isinstance(item, str):
-                                                if is_animal_from_id_or_name(None, item):
+                                                if is_animal_from_name(item):
                                                     external_animal_detected = True
                                                     logging.info("External detection log indicates animal class '%s'", item)
                                                     break
-                                            else:
-                                                if is_animal_from_id_or_name(item, None):
-                                                    external_animal_detected = True
-                                                    logging.info("External detection log indicates animal class id '%s'", str(item))
-                                                    break
+                                            # ignore numeric ids
                                     elif isinstance(classes_field, str):
-                                        if is_animal_from_id_or_name(None, classes_field):
+                                        if is_animal_from_name(classes_field):
                                             external_animal_detected = True
                                             logging.info("External detection log indicates animal class '%s'", classes_field)
-                                    else:
-                                        if is_animal_from_id_or_name(classes_field, None):
-                                            external_animal_detected = True
-                                            logging.info("External detection log indicates animal class id '%s'", str(classes_field))
                                 except Exception:
                                     pass
                         else:
@@ -622,12 +597,12 @@ def main(show=False):
         frame_count = len(frame_boxes)
         detected_classes_names = [model.names.get(c, str(c)) for c in frame_classes]
 
-        # Determine if any detected classes are animals (from model output)
+        # Determine if any detected classes are animals (from model output) - name-only
         animal_detected = False
         try:
             for cid in frame_classes:
                 name = model.names.get(cid, str(cid)).lower()
-                if is_animal_from_id_or_name(cid, name):
+                if is_animal_from_name(name):
                     animal_detected = True
                     logging.info("Animal detected in frame: class_id=%s name=%s", str(cid), name)
                     break
@@ -664,11 +639,11 @@ def main(show=False):
                 frame_count = len(frame_boxes)
                 logging.info("After tiled merge: frame_count=%d", frame_count)
 
-                # Update animal_detected flag with tiled results as well
+                # Update animal_detected flag with tiled results as well (name-only)
                 try:
                     for cid in frame_classes:
                         name = model.names.get(cid, str(cid)).lower()
-                        if is_animal_from_id_or_name(cid, name):
+                        if is_animal_from_name(name):
                             animal_detected = True
                             logging.info("Animal detected after tiled merge: class_id=%s name=%s", str(cid), name)
                             break
