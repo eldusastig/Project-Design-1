@@ -21,10 +21,9 @@
 #define ULTRASONIC_TRIG2  27
 #define ULTRASONIC_ECHO2  26
 #define BUZZER_PIN        14
+#define HX711_dout = 4;
 
-const int HX711_dout = 4;
-
-const int HX711_sck  = 23;
+#define HX711_sck  = 23;
 
 Preferences prefs;
 
@@ -91,8 +90,8 @@ bool waterSamplesInit = false;
 
 bool lastFloodedState = false;
 
-int WATER_THRESHOLD_WET = 970;  
-int WATER_THRESHOLD_DRY = 969;  
+int WATER_THRESHOLD_WET = 550;  
+int WATER_THRESHOLD_DRY = 500;  
 
 bool USE_EMA = false;
 float waterEMA = -1.0;
@@ -232,7 +231,7 @@ void publishUltrasonicBlock(float d1f, float d2f, bool stableBinFull) {
     + "\"d1\":" + String((long)(d1f < 0 ? -1 : (long)d1f)) + ","
     + "\"d2\":" + String((long)(d2f < 0 ? -1 : (long)d2f)) + ","
     + "\"ts\":" + String(millis()) + "}";
-  client.beginMessage(topic.c_str(), p`yload.length(), false, 1);
+  client.beginMessage(topic.c_str(), payload.length(), false, 1);
   client.print(payload);
   client.endMessage();
   if (!suspendSensorOutput) Serial.println("Published ultrasonic: " + payload);
@@ -1215,7 +1214,7 @@ void loop() {
         Serial.print("Bin fullness based on weight (kg): "); Serial.println(weight_kg, 3);
         Serial.print("rawBinFull (weight >= "); Serial.print(BIN_FULL_KG); Serial.print(") = "); Serial.println(rawBinFull ? "1" : "0");
       }
-    } if{
+    } else{
       // fallback to ultrasonic if no load cell
       float min12 = -1.0;
       if (d1 > 0 && d1 >= SENSOR_MIN_CM) min12 = (min12 < 0 ? d1 : min(min12, (float)d1));
